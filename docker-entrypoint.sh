@@ -1,67 +1,36 @@
 #!/bin/sh
-set -eu
+set -e
 
-log() { printf '%s\n' "$*" >&2; }
-
-# Raise default nofile limit for HAProxy v3 (best-effort)
+# Raise default nofile limit for HAProxy v3
 ulimit -n 10000 2>/dev/null || true
 
-# IPv6 is ALWAYS disabled: bind IPv4 only
-BIND_CONFIG=":2375"
-log "IPv6 forced disabled: binding IPv4 only ($BIND_CONFIG)"
+# Normalize the input for DISABLE_IPV6 to lowercase
+DISABLE_IPV6_LOWER=$(echo "$DISABLE_IPV6" | tr '[:upper:]' '[:lower:]')
 
-# Best-effort OS-level IPv6 disable inside the container/namespace.
-# (May fail if /proc/sys is read-only or not permitted; that's ok.)
-disable_ipv6_sysctl() {
-  for p in \
-    /proc/sys/net/ipv6/conf/all/disable_ipv6 \
-    /proc/sys/net/ipv6/conf/default/disable_ipv6 \
-    /proc/sys/net/ipv6/conf/lo/disable_ipv6
-  do
-    if [ -w "$p" ]; then
-      printf '1' > "$p" 2>/dev/null || true
-    fi
-  done
-}
-disable_ipv6_sysctl
+# Check for different representations of 'true' and set BIND_CONFIG
+case "$DISABLE_IPV6_LOWER" in
+    1|true|yes)
+        BIND_CONFIG=":2375"
+        ;;
+    *)
+        BIND_CONFIG="[::]:2375 v4v6"
+        ;;
+esac
 
-TEMPLATE=/usr/local/etc/haproxy/haproxy.cfg.template
-OUT=/tmp/haproxy.cfg
+# Process the HAProxy configuration template using sed
+sed "s/\${BIND_CONFIG}/$BIND_CONFIG/g" /usr/local/etc/haproxy/haproxy.cfg.template > /tmp/haproxy.cfg
 
-if [ ! -r "$TEMPLATE" ]; then
-  log "ERROR: template not found or not readable: $TEMPLATE"
-  exit 1
+# first arg is `-f` or `--some-option`
+if [ "${1#-}" != "$1" ]; then
+	set -- haproxy "$@"
 fi
 
-# Escape replacement for sed (&, /, \)
-escape_sed_repl() {
-  printf '%s' "$1" | sed 's/[\/&\\]/\\&/g'
-}
-BIND_ESCAPED=$(escape_sed_repl "$BIND_CONFIG")
-
-# Fail fast if placeholder isn't present
-if ! grep -q '\${BIND_CONFIG}' "$TEMPLATE"; then
-  log "ERROR: template does not contain \${BIND_CONFIG} placeholder"
-  exit 1
-fi
-
-# Render config
-sed "s/\${BIND_CONFIG}/${BIND_ESCAPED}/g" "$TEMPLATE" > "$OUT"
-
-# If first arg looks like an option, prepend haproxy
-if [ "${1:-}" != "" ] && [ "${1#-}" != "$1" ]; then
-  set -- haproxy "$@"
-fi
-
-# Default command if nothing provided
-if [ "${1:-}" = "" ]; then
-  set -- haproxy
-fi
-
-if [ "$1" = "haproxy" ]; then
-  shift
-  # master-worker, no daemon; and make sure we use the rendered config
-  set -- haproxy -W -db -f "$OUT" "$@"
+if [ "$1" = 'haproxy' ]; then
+	shift # "haproxy"
+	# if the user wants "haproxy", let's add a couple useful flags
+	#   -W  -- "master-worker mode" (similar to the old "haproxy-systemd-wrapper"; allows for reload via "SIGUSR2")
+	#   -db -- disables background mode
+	set -- haproxy -W -db "$@"
 fi
 
 exec "$@"
